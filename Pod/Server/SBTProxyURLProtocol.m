@@ -234,11 +234,39 @@ typedef void(^SBTStubUpdateBlock)(NSURLRequest *request);
         NSURLRequest *request = self.request;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(stubbingResponseTime * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf)strongSelf = weakSelf;
+            NSData *responseData = stubResponse.data;
+            NSInteger *responseCode = stubbingStatusCode;
+            NSMutableDictionary<NSString *, NSString*> *responseHeaders = [stubResponse.headers mutableCopy];
             
-            strongSelf.response = [[NSHTTPURLResponse alloc] initWithURL:request.URL statusCode:stubbingStatusCode HTTPVersion:@"1.1" headerFields:stubResponse.headers];
+            NSString *rangeHeaderValue = [request valueForHTTPHeaderField:@"Range"];
+            if (rangeHeaderValue != nil) {
+                NSString *sanitizedString = [rangeHeaderValue stringByReplacingOccurrencesOfString:@"bytes=" withString:@""];
+                NSString *firstRange = [sanitizedString componentsSeparatedByString:@", "][0];
+                NSArray<NSString *> *rangeComponents = [firstRange componentsSeparatedByString:@"-"];
+                if (rangeComponents.count == 2) {
+                    NSInteger start = [rangeComponents[0] integerValue];
+                    NSInteger end = [rangeComponents[1] integerValue];
+                    NSInteger length = end - start;
+                    NSRange bytesRange = NSMakeRange(start, length + 1);
+                    NSData *subData;
+                    @try {
+                        subData = [stubResponse.data subdataWithRange:bytesRange];
+                    } @catch (NSException *exception) {
+                        NSLog(@"%@", exception.reason);
+                    }
+                    if (subData != nil) {
+                        responseData = subData;
+                        responseCode = 206;
+                        responseHeaders[@"Content-Range"] = [NSString stringWithFormat:@"bytes %d-%d/%lu", start, end, (unsigned long)[stubResponse.data length]];
+                        responseHeaders[@"Content-Length"] = [NSString stringWithFormat:@"%lu", (unsigned long)[subData length]];
+                    }
+                }
+            }
+            
+            strongSelf.response = [[NSHTTPURLResponse alloc] initWithURL:request.URL statusCode:responseCode HTTPVersion:@"1.1" headerFields:responseHeaders];
             
             [client URLProtocol:strongSelf didReceiveResponse:strongSelf.response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-            [client URLProtocol:strongSelf didLoadData:stubResponse.data];
+            [client URLProtocol:strongSelf didLoadData:responseData];
             [client URLProtocolDidFinishLoading:strongSelf];
             
             // check if the request is also proxied, we might need to manually invoke the block here
@@ -248,7 +276,7 @@ typedef void(^SBTStubUpdateBlock)(NSURLRequest *request);
                         SBTProxyResponseBlock block = matchingRule[SBTProxyURLProtocolBlockKey];
                         
                         if (![block isEqual:[NSNull null]] && block != nil) {
-                            block(request, request, (NSHTTPURLResponse *)strongSelf.response, stubResponse.data, stubbingResponseTime, YES);
+                            block(request, request, (NSHTTPURLResponse *)strongSelf.response, responseData, stubbingResponseTime, YES);
                         }
                     }
                 }
